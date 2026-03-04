@@ -13,7 +13,7 @@ const KEYCHAIN_SERVICE: &str = "openrouter-api-key";
 const KEYCHAIN_ACCOUNT: &str = "openrouter";
 
 #[derive(Parser, Debug)]
-#[command(name = "stips", about = "OpenRouter credits and usage CLI")]
+#[command(name = "stips", about = "OpenRouter credits and usage CLI", version)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,

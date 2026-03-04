@@ -19,3 +19,7 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+[dev-dependencies]
+assert_cmd = "2.1.2"
+predicates = "3.1.4"
