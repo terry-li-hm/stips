@@ -744,6 +744,7 @@ dependencies = [
  "clap",
  "predicates",
  "serde",
+ "serde_json",
  "ureq",
 ]
 
