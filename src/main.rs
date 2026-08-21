@@ -81,6 +81,12 @@ struct UsageData {
     usage_daily: f64,
     usage_weekly: f64,
     usage_monthly: f64,
+    #[serde(default)]
+    byok_usage_daily: f64,
+    #[serde(default)]
+    byok_usage_weekly: f64,
+    #[serde(default)]
+    byok_usage_monthly: f64,
 }
 
 #[derive(Debug, serde::Serialize, PartialEq)]
@@ -160,9 +166,12 @@ fn cmd_usage(json: bool) -> Result<(), AppError> {
     let url = usage_endpoint(&base_url());
     let response = request_json::<UsageEnvelope>(&url, &key)?;
 
-    let daily = normalize_usage(response.data.usage_daily);
-    let weekly = normalize_usage(response.data.usage_weekly);
-    let monthly = normalize_usage(response.data.usage_monthly);
+    let daily = combined_usage(response.data.usage_daily, response.data.byok_usage_daily);
+    let weekly = combined_usage(response.data.usage_weekly, response.data.byok_usage_weekly);
+    let monthly = combined_usage(
+        response.data.usage_monthly,
+        response.data.byok_usage_monthly,
+    );
 
     if json {
         println!(
@@ -282,12 +291,27 @@ fn normalize_usage(value: f64) -> f64 {
     value
 }
 
+fn combined_usage(openrouter: f64, byok: f64) -> f64 {
+    normalize_usage(openrouter) + normalize_usage(byok)
+}
+
 fn remaining_credits(total_credits: f64, total_usage: f64) -> f64 {
     total_credits - total_usage
 }
 
+fn format_usd(amount: f64) -> String {
+    if amount < 0.0 {
+        format!("-${:.2}", amount.abs())
+    } else {
+        format!("${amount:.2}")
+    }
+}
+
 fn format_credits_text(remaining: f64, used: f64, total: f64) -> String {
-    format!("${remaining:.2} remaining  (${used:.2} used of ${total:.2})")
+    format!(
+        "{} remaining  (${used:.2} used of ${total:.2})",
+        format_usd(remaining)
+    )
 }
 
 fn format_credits_json(remaining: f64, used: f64, total: f64) -> Result<String, serde_json::Error> {
@@ -439,11 +463,10 @@ mod tests {
     }
 
     #[test]
-    fn format_credits_text_negative_remaining_puts_dollar_before_sign() {
-        // Behaviour: overdrawn balances render as `$-1.50`, not `-$1.50`.
+    fn format_credits_text_negative_remaining_puts_sign_before_dollar() {
         assert_eq!(
             format_credits_text(-1.5, 11.5, 10.0),
-            "$-1.50 remaining  ($11.50 used of $10.00)"
+            "-$1.50 remaining  ($11.50 used of $10.00)"
         );
     }
 
@@ -528,10 +551,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_usage_ignores_byok_fields_and_understates_combined_spend() {
+    fn parse_usage_includes_byok_fields_in_combined_spend() {
         // Official GET /key example includes both usage_* and byok_usage_*.
-        // Current structs keep OpenRouter usage only, so reported spend drops
-        // the BYOK component.
+        // Combined spend includes the BYOK component.
         let parsed = parse_usage(
             r#"{
                 "data": {
@@ -552,11 +574,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(parsed.data.usage_daily, 25.5);
-        assert_eq!(
-            normalize_usage(parsed.data.usage_daily),
-            25.5,
-            "BYOK daily 17.38 is dropped; combined daily spend 42.88 is never shown"
-        );
+        assert_eq!(parsed.data.byok_usage_daily, 17.38);
+        let daily = combined_usage(parsed.data.usage_daily, parsed.data.byok_usage_daily);
+        let weekly = combined_usage(parsed.data.usage_weekly, parsed.data.byok_usage_weekly);
+        let monthly = combined_usage(parsed.data.usage_monthly, parsed.data.byok_usage_monthly);
+        assert_eq!(format!("{daily:.2}"), "42.88");
+        assert_eq!(format!("{weekly:.2}"), "42.88");
+        assert_eq!(format!("{monthly:.2}"), "42.88");
+        assert_ne!(daily, parsed.data.usage_daily);
     }
 
     #[test]
