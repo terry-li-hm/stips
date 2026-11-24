@@ -1,6 +1,6 @@
 # stips
 
-OpenRouter CLI — check credits, view usage, manage your API key.
+OpenRouter CLI — check credits, view usage, and open the API keys page.
 
 [![Crates.io](https://img.shields.io/crates/v/stips)](https://crates.io/crates/stips)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -15,15 +15,9 @@ cargo install stips
 
 ## Setup
 
-Get an API key at [openrouter.ai/keys](https://openrouter.ai/keys), then save it to the macOS Keychain:
+Get an API key at [openrouter.ai/keys](https://openrouter.ai/keys). Supply it through `OPENROUTER_API_KEY` using your shell or secret manager. Do not pass the key as a `stips` argument.
 
-```bash
-stips key save sk-or-...
-```
-
-The key is stored under the service name `openrouter-api-key` and retrieved automatically on each command.
-
-On non-macOS platforms, set the `OPENROUTER_API_KEY` environment variable instead (see [Environment Variables](#environment-variables)).
+On macOS, you can instead use the Keychain Access app to create a password item in your login keychain. Use `openrouter-api-key` as the item name (service), `openrouter` as the account name, and your API key as the password. `stips` reads this item when no environment key is set; existing Keychain entries continue to work.
 
 ## Commands
 
@@ -87,20 +81,13 @@ Open [openrouter.ai/keys](https://openrouter.ai/keys) in the default browser (ma
 stips key open
 ```
 
-### `stips key save <key>`
-
-Save an API key to the macOS Keychain (macOS only). Overwrites any previously saved key.
-
-```bash
-stips key save sk-or-v1-...
-```
-
 ## Environment Variables
 
 | Variable | Description |
 |---|---|
 | `OPENROUTER_API_KEY` | API key. Takes precedence over the macOS Keychain. Required on non-macOS platforms. |
-| `OPENROUTER_BASE_URL` | Override the API base URL (default: `https://openrouter.ai`). Useful for testing against a local mock. |
+
+Unset the retired `OPENROUTER_BASE_URL` variable, even if its value is empty. The default command, `credits`, and `usage` refuse to run while it is set. Authenticated requests target `https://openrouter.ai` (`/api/v1/credits` or `/api/v1/auth/key`), do not follow redirects, and have a 10-second timeout. Standard proxy settings such as `HTTPS_PROXY` still apply.
 
 ## Low Balance Warning
 
@@ -108,19 +95,23 @@ When `stips credits` (or bare `stips`) detects that your remaining balance is **
 
 ## Changelog
 
+### Unreleased
+
+- Retired CLI credential writes; existing environment and Keychain credentials still work.
+- Removed the API endpoint override for authenticated requests.
+
 ### v0.2.0
 
 - **`--json` flag** added to `credits` and `usage` for machine-readable output
 - **Fixed `usage` values**: removed incorrect `/100` scaling heuristic — the API always returns dollar-denominated floats
 - **Fixed exit code**: low-balance warning no longer causes a non-zero exit
-- **Platform guards**: `key save` and `key open` now compile and fail gracefully on non-macOS
-- **`OPENROUTER_BASE_URL` override** for testing against local mocks
+- **Platform guards**: Keychain integration and browser opening are macOS-only
 
 ### v0.1.x
 
 - **v0.1.2** — minor dependency cleanup
 - **v0.1.1** — removed unused `serde_json` dependency
-- **v0.1.0** — initial release: `credits`, `usage`, `key open`, `key save`, macOS Keychain integration
+- **v0.1.0** — initial release: `credits`, `usage`, `key open`, macOS Keychain integration
 
 ## License
 

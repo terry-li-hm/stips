@@ -17,9 +17,6 @@ fn test_help() {
         .stdout(predicate::str::contains("Usage"));
 }
 
-// --version is not wired up in the Cli struct (no `#[command(version)]`),
-// so clap rejects it as an unknown argument.  This test pins that behaviour:
-// unknown flag → exit failure, stderr contains "error".
 #[test]
 fn test_version() {
     stips()
@@ -29,52 +26,80 @@ fn test_version() {
         .stdout(predicate::str::contains("stips"));
 }
 
-// No args: stips defaults to the credits subcommand, which requires a
-// keychain entry.  Without one the binary exits 1 and prints missing-key
-// guidance on stderr.
-// Marked #[ignore] because the test machine may have a real keychain entry
-// that would trigger an outbound network call instead of the error path.
 #[test]
-#[ignore = "requires no keychain entry present; would make a network call if one exists"]
-fn test_no_args_missing_key() {
-    stips()
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("stips key save"));
+fn test_override_is_rejected_on_all_read_commands_without_echo() {
+    let diagnostic =
+        "Error: OPENROUTER_BASE_URL is no longer supported. Unset it to use OpenRouter.\n";
+    for args in [
+        &[][..],
+        &["credits"][..],
+        &["credits", "--json"][..],
+        &["usage"][..],
+        &["usage", "--json"][..],
+    ] {
+        for endpoint in [
+            "",
+            "https://openrouter.ai",
+            "https://example.invalid/url-sentinel",
+        ] {
+            stips()
+                .args(args)
+                .env("OPENROUTER_BASE_URL", endpoint)
+                // An invalid header also prevents network I/O if the guard regresses.
+                .env("OPENROUTER_API_KEY", "offline-override-key-sentinel\n")
+                .assert()
+                .code(1)
+                .stdout("")
+                .stderr(diagnostic);
+        }
+    }
 }
 
-// `credits` subcommand also requires a keychain entry; same error path.
-// Ignored for the same reason as test_no_args_missing_key.
+#[cfg(unix)]
 #[test]
-#[ignore = "requires no keychain entry present; would make a network call if one exists"]
-fn test_credits_missing_key() {
-    stips()
-        .arg("credits")
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("API key not found"));
-}
+fn test_non_unicode_override_is_rejected() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
 
-// `usage` subcommand also requires a keychain entry.
-// Ignored for the same reason as test_no_args_missing_key.
-#[test]
-#[ignore = "requires no keychain entry present; would make a network call if one exists"]
-fn test_usage_missing_key() {
     stips()
         .arg("usage")
+        .env("OPENROUTER_BASE_URL", OsStr::from_bytes(b"\xff"))
+        .env("OPENROUTER_API_KEY", "offline-override-key-sentinel\n")
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("API key not found"));
+        .code(1)
+        .stdout("")
+        .stderr("Error: OPENROUTER_BASE_URL is no longer supported. Unset it to use OpenRouter.\n");
 }
 
-// `key save` with no key argument is a clap parse error → exit 2.
 #[test]
-fn test_key_save_missing_argument() {
+fn test_retired_key_save_rejects_trailing_args_without_echo() {
+    let sentinel = "offline-retired-key-sentinel";
+    let diagnostic = "Error: This credential command has been retired. Set OPENROUTER_API_KEY or use macOS Keychain Access (service: openrouter-api-key, account: openrouter).\n";
+    for trailing in [
+        &[][..],
+        &[sentinel][..],
+        &[sentinel, "--help", "--unknown"][..],
+    ] {
+        stips()
+            .args(["key", "save"])
+            .args(trailing)
+            // Never allow this test to reach the system security tool.
+            .env("PATH", "")
+            .assert()
+            .code(1)
+            .stdout("")
+            .stderr(diagnostic);
+    }
+}
+
+#[test]
+fn test_key_help_lists_open_and_omits_save() {
     stips()
-        .args(["key", "save"])
+        .args(["key", "--help"])
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("error"));
+        .success()
+        .stdout(predicate::str::contains("open"))
+        .stdout(predicate::str::contains("save").not());
 }
 
 // `key` with no subcommand: clap prints a usage block and exits 2.

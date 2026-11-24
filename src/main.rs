@@ -1,15 +1,21 @@
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::{self, IsTerminal};
-use std::process::{Command, ExitCode};
+#[cfg(target_os = "macos")]
+use std::process::Command;
+use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use serde::Deserialize;
+use ureq::http::{Request, Response, header};
 
 const OPENROUTER_KEYS_PAGE: &str = "https://openrouter.ai/keys";
 const OPENROUTER_TOPUP_PAGE: &str = "https://openrouter.ai/credits";
 const KEYCHAIN_SERVICE: &str = "openrouter-api-key";
 const KEYCHAIN_ACCOUNT: &str = "openrouter";
 const LOW_BALANCE_THRESHOLD: f64 = 5.0;
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Parser, Debug)]
 #[command(name = "stips", about = "OpenRouter credits and usage CLI", version)]
@@ -37,26 +43,44 @@ enum Commands {
 #[derive(Subcommand, Debug)]
 enum KeyCommands {
     Open,
-    Save { key: String },
+}
+
+#[derive(Clone, Copy)]
+enum Endpoint {
+    Credits,
+    Usage,
+}
+
+impl Endpoint {
+    fn url(self) -> &'static str {
+        match self {
+            Self::Credits => "https://openrouter.ai/api/v1/credits",
+            Self::Usage => "https://openrouter.ai/api/v1/auth/key",
+        }
+    }
 }
 
 #[derive(Debug)]
 enum AppError {
     ApiKeyMissing,
-    Message(String),
+    CredentialWriteRetired,
+    HttpStatus(u16),
+    Message(&'static str),
 }
 
 impl fmt::Display for AppError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ApiKeyMissing => {
-                write!(
-                    f,
-                    "Error: API key not found. Run: stips key save <your-key>"
-                )
-            }
-            Self::Message(msg) => write!(f, "{msg}"),
-        }
+        let problem = match self {
+            Self::ApiKeyMissing => "API key not found",
+            Self::CredentialWriteRetired => "This credential command has been retired",
+            Self::HttpStatus(code) => return write!(f, "Error: OpenRouter returned HTTP {code}."),
+            Self::Message(msg) => return write!(f, "Error: {msg}"),
+        };
+        write!(
+            f,
+            "Error: {problem}. Set OPENROUTER_API_KEY or use macOS Keychain Access \
+             (service: {KEYCHAIN_SERVICE}, account: {KEYCHAIN_ACCOUNT})."
+        )
     }
 }
 
@@ -113,85 +137,104 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<(), AppError> {
-    let cli = Cli::parse();
-    let is_tty = io::stdout().is_terminal();
-
-    match cli.command {
-        None => cmd_credits(is_tty, false),
-        Some(Commands::Credits { json }) => cmd_credits(is_tty, json),
-        Some(Commands::Usage { json }) => cmd_usage(json),
-        Some(Commands::Key { command }) => match command {
-            KeyCommands::Open => cmd_key_open(),
-            KeyCommands::Save { key } => cmd_key_save(&key),
-        },
+fn parse_cli(args: impl IntoIterator<Item = OsString>) -> Result<Cli, AppError> {
+    let mut args = args.into_iter();
+    let program = args.next();
+    let first = args.next();
+    let second = args.next();
+    // Reject the retired syntax before clap can include any trailing arguments
+    // in a parse error. Do not consume or interpret the trailing arguments.
+    if first.as_deref() == Some(OsStr::new("key")) && second.as_deref() == Some(OsStr::new("save"))
+    {
+        return Err(AppError::CredentialWriteRetired);
     }
+    Ok(Cli::parse_from(
+        program.into_iter().chain(first).chain(second).chain(args),
+    ))
 }
 
-fn cmd_credits(is_tty: bool, json: bool) -> Result<(), AppError> {
-    let key = read_api_key_from_keychain()?;
-    let url = credits_endpoint(&base_url());
-    let response = request_json::<CreditsEnvelope>(&url, &key)?;
-    let remaining = remaining_credits(response.data.total_credits, response.data.total_usage);
+fn run() -> Result<(), AppError> {
+    let (endpoint, json) = match parse_cli(std::env::args_os())?.command {
+        None => (Endpoint::Credits, false),
+        Some(Commands::Credits { json }) => (Endpoint::Credits, json),
+        Some(Commands::Usage { json }) => (Endpoint::Usage, json),
+        Some(Commands::Key {
+            command: KeyCommands::Open,
+        }) => return cmd_key_open(),
+    };
 
-    if json {
-        println!(
-            "{}",
-            format_credits_json(
-                remaining,
-                response.data.total_usage,
-                response.data.total_credits
-            )
-            .map_err(|e| AppError::Message(format!("Error: {e}")))?
-        );
-    } else {
-        println!(
-            "{}",
-            format_credits_text(
-                remaining,
-                response.data.total_usage,
-                response.data.total_credits
-            )
-        );
-        if let Some(msg) = low_balance_message(remaining, is_tty) {
-            eprintln!("{msg}");
+    let (output, warning) = run_query(
+        endpoint,
+        json,
+        io::stdout().is_terminal(),
+        std::env::var_os("OPENROUTER_BASE_URL").is_some(),
+        read_api_key,
+        ureq::Agent::run,
+    )?;
+    println!("{output}");
+    if let Some(warning) = warning {
+        eprintln!("{warning}");
+    }
+    Ok(())
+}
+
+type HttpResult = Result<Response<ureq::Body>, ureq::Error>;
+
+fn run_query(
+    endpoint: Endpoint,
+    json: bool,
+    is_tty: bool,
+    has_endpoint_override: bool,
+    read_key: impl FnOnce() -> Result<String, AppError>,
+    send: impl FnOnce(&ureq::Agent, Request<()>) -> HttpResult,
+) -> Result<(String, Option<String>), AppError> {
+    if has_endpoint_override {
+        return Err(AppError::Message(
+            "OPENROUTER_BASE_URL is no longer supported. Unset it to use OpenRouter.",
+        ));
+    }
+    let key = read_key()?;
+    let json_error = |_| AppError::Message("Could not format JSON output.");
+    match endpoint {
+        Endpoint::Credits => {
+            let response: CreditsEnvelope = request_json(endpoint, &key, send)?;
+            let used = response.data.total_usage;
+            let total = response.data.total_credits;
+            let remaining = remaining_credits(total, used);
+            if json {
+                Ok((
+                    format_credits_json(remaining, used, total).map_err(json_error)?,
+                    None,
+                ))
+            } else {
+                Ok((
+                    format_credits_text(remaining, used, total),
+                    low_balance_message(remaining, is_tty),
+                ))
+            }
+        }
+        Endpoint::Usage => {
+            let response: UsageEnvelope = request_json(endpoint, &key, send)?;
+            let data = response.data;
+            let daily = combined_usage(data.usage_daily, data.byok_usage_daily);
+            let weekly = combined_usage(data.usage_weekly, data.byok_usage_weekly);
+            let monthly = combined_usage(data.usage_monthly, data.byok_usage_monthly);
+            let output = if json {
+                format_usage_json(daily, weekly, monthly).map_err(json_error)?
+            } else {
+                format_usage_text(daily, weekly, monthly)
+            };
+            Ok((output, None))
         }
     }
-
-    Ok(())
-}
-
-fn cmd_usage(json: bool) -> Result<(), AppError> {
-    let key = read_api_key_from_keychain()?;
-    let url = usage_endpoint(&base_url());
-    let response = request_json::<UsageEnvelope>(&url, &key)?;
-
-    let daily = combined_usage(response.data.usage_daily, response.data.byok_usage_daily);
-    let weekly = combined_usage(response.data.usage_weekly, response.data.byok_usage_weekly);
-    let monthly = combined_usage(
-        response.data.usage_monthly,
-        response.data.byok_usage_monthly,
-    );
-
-    if json {
-        println!(
-            "{}",
-            format_usage_json(daily, weekly, monthly)
-                .map_err(|e| AppError::Message(format!("Error: {e}")))?
-        );
-    } else {
-        println!("{}", format_usage_text(daily, weekly, monthly));
-    }
-
-    Ok(())
 }
 
 #[cfg(not(target_os = "macos"))]
 fn cmd_key_open() -> Result<(), AppError> {
     println!("{OPENROUTER_KEYS_PAGE}");
-    Err(AppError::Message(String::from(
-        "Error: stips key open requires macOS. Visit the URL above in your browser.",
-    )))
+    Err(AppError::Message(
+        "stips key open requires macOS. Visit the URL above in your browser.",
+    ))
 }
 
 #[cfg(target_os = "macos")]
@@ -200,59 +243,22 @@ fn cmd_key_open() -> Result<(), AppError> {
     let status = Command::new("open")
         .arg(OPENROUTER_KEYS_PAGE)
         .status()
-        .map_err(|err| AppError::Message(format!("Error: failed to run open: {err}")))?;
+        .map_err(|_| AppError::Message("failed to run open"))?;
 
     if status.success() {
         Ok(())
     } else {
-        Err(AppError::Message(String::from("Error: failed to open URL")))
+        Err(AppError::Message("failed to open URL"))
     }
 }
 
-#[cfg(not(target_os = "macos"))]
-fn cmd_key_save(_key: &str) -> Result<(), AppError> {
-    Err(AppError::Message(String::from(
-        "Error: stips key save requires macOS Keychain. Set OPENROUTER_API_KEY env var instead.",
-    )))
-}
-
-#[cfg(target_os = "macos")]
-fn cmd_key_save(key: &str) -> Result<(), AppError> {
-    let status = Command::new("security")
-        .args([
-            "add-generic-password",
-            "-s",
-            KEYCHAIN_SERVICE,
-            "-a",
-            KEYCHAIN_ACCOUNT,
-            "-w",
-            key,
-            "-U",
-        ])
-        .status()
-        .map_err(|err| AppError::Message(format!("Error: failed to run security: {err}")))?;
-
-    if status.success() {
-        println!("API key saved to keychain");
-        Ok(())
-    } else {
-        Err(AppError::Message(String::from(
-            "Error: failed to save API key to keychain",
-        )))
-    }
-}
-
-fn read_api_key_from_keychain() -> Result<String, AppError> {
-    // Check env var first — works on all platforms and enables test injection.
+fn read_api_key() -> Result<String, AppError> {
     if let Some(key) = api_key_from_env(std::env::var("OPENROUTER_API_KEY").ok()) {
         return Ok(key);
     }
 
     #[cfg(not(target_os = "macos"))]
-    return Err(AppError::Message(String::from(
-        "Error: no OPENROUTER_API_KEY env var set. \
-         On macOS, run: stips key save <your-key>",
-    )));
+    return Err(AppError::ApiKeyMissing);
 
     #[cfg(target_os = "macos")]
     {
@@ -269,19 +275,52 @@ fn read_api_key_from_keychain() -> Result<String, AppError> {
     }
 }
 
-fn request_json<T: for<'de> Deserialize<'de>>(url: &str, api_key: &str) -> Result<T, AppError> {
-    let response = ureq::get(url)
-        .header("Authorization", &format!("Bearer {api_key}"))
-        .call()
-        .map_err(|err| AppError::Message(format!("Error: {err}")))?;
+fn request_json<T: serde::de::DeserializeOwned>(
+    endpoint: Endpoint,
+    api_key: &str,
+    send: impl FnOnce(&ureq::Agent, Request<()>) -> HttpResult,
+) -> Result<T, AppError> {
+    let mut bearer = header::HeaderValue::from_str(&format!("Bearer {api_key}"))
+        .map_err(|_| AppError::Message("Invalid API key format."))?;
+    bearer.set_sensitive(true);
+    let request = Request::get(endpoint.url())
+        .header(header::AUTHORIZATION, bearer)
+        .body(())
+        .map_err(|_| AppError::Message("Could not build OpenRouter request."))?;
+    let agent = ureq::Agent::config_builder()
+        .https_only(true)
+        .max_redirects(0)
+        .http_status_as_error(false)
+        .timeout_global(Some(REQUEST_TIMEOUT))
+        .build()
+        .new_agent();
+    let mut response = send(&agent, request)
+        .map_err(|err| sanitized_http_error(err, "OpenRouter request failed."))?;
 
-    let mut body = response.into_body();
-    body.read_json::<T>()
-        .map_err(|err| AppError::Message(format!("Error: {err}")))
+    // With redirects disabled, ureq returns the 3xx response to us. Do not
+    // inspect its Location or try to parse its body as a successful response.
+    let status = response.status();
+    if status.is_redirection() {
+        return Err(AppError::Message("OpenRouter HTTP redirect refused."));
+    }
+    if !status.is_success() {
+        return Err(AppError::HttpStatus(status.as_u16()));
+    }
+    let bytes = response
+        .body_mut()
+        .read_to_vec()
+        .map_err(|err| sanitized_http_error(err, "Could not read OpenRouter response."))?;
+    serde_json::from_slice(&bytes).map_err(|_| AppError::Message("Invalid OpenRouter response."))
 }
 
-fn base_url() -> String {
-    resolve_base_url(std::env::var("OPENROUTER_BASE_URL").ok())
+fn sanitized_http_error(error: ureq::Error, fallback: &'static str) -> AppError {
+    match error {
+        ureq::Error::Timeout(_) => AppError::Message("OpenRouter request timed out."),
+        ureq::Error::Io(err) if err.kind() == io::ErrorKind::TimedOut => {
+            AppError::Message("OpenRouter request timed out.")
+        }
+        _ => AppError::Message(fallback),
+    }
 }
 
 /// Returns usage in USD as returned by `GET /api/v1/auth/key`.
@@ -346,22 +385,11 @@ fn low_balance_message(remaining: f64, is_tty: bool) -> Option<String> {
     }
 }
 
-fn credits_endpoint(base: &str) -> String {
-    format!("{base}/api/v1/credits")
-}
-
-fn usage_endpoint(base: &str) -> String {
-    format!("{base}/api/v1/auth/key")
-}
-
-fn resolve_base_url(from_env: Option<String>) -> String {
-    from_env.unwrap_or_else(|| String::from("https://openrouter.ai"))
-}
-
 fn api_key_from_env(from_env: Option<String>) -> Option<String> {
     from_env.filter(|key| !key.is_empty())
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn api_key_from_keychain_stdout(stdout: &[u8]) -> Result<String, AppError> {
     let key = String::from_utf8_lossy(stdout).trim().to_owned();
     if key.is_empty() {
@@ -659,44 +687,253 @@ mod tests {
     }
 
     #[test]
-    fn resolve_base_url_default_empty_and_override() {
-        assert_eq!(resolve_base_url(None), "https://openrouter.ai");
-        assert_eq!(
-            resolve_base_url(Some(String::from("https://example.test"))),
-            "https://example.test"
-        );
-        // Empty env is Ok(""), not unset, so the default is skipped.
-        assert_eq!(resolve_base_url(Some(String::new())), "");
+    fn retired_key_command_stops_before_consuming_trailing_args() {
+        let args = ["stips", "key", "save"]
+            .into_iter()
+            .map(OsString::from)
+            .chain(std::iter::from_fn(|| {
+                panic!("read a retired credential argument")
+            }));
+        assert!(matches!(
+            parse_cli(args),
+            Err(AppError::CredentialWriteRetired)
+        ));
+    }
+
+    const SYNTHETIC_KEY: &str = "offline-test-credential-sentinel";
+    const MOCK_CREDITS: &str = r#"{"data":{"total_credits":10,"total_usage":8}}"#;
+
+    fn stub_key() -> Result<String, AppError> {
+        Ok(SYNTHETIC_KEY.to_owned())
+    }
+
+    fn mock_response(
+        url: &str,
+        body: &str,
+    ) -> impl FnOnce(&ureq::Agent, Request<()>) -> HttpResult {
+        move |agent, request| {
+            assert_eq!(request.method(), "GET");
+            assert_eq!(request.uri(), url);
+            let auth = &request.headers()[header::AUTHORIZATION];
+            assert_eq!(auth, &format!("Bearer {SYNTHETIC_KEY}"));
+            assert!(auth.is_sensitive());
+            assert!(agent.config().https_only());
+            Ok(Response::new(ureq::Body::builder().data(body)))
+        }
     }
 
     #[test]
-    fn endpoints_join_with_single_slash_and_keep_legacy_usage_path() {
+    fn https_proxy_from_env_is_preserved() {
+        const CHILD: &str = "STIPS_TEST_HTTPS_PROXY_CHILD";
+        const PROXY: &str = "http://offline-proxy.invalid:3128/";
+
+        if std::env::var_os(CHILD).is_none() {
+            // Set the test environment only in the child, not in the parallel test process.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "tests::https_proxy_from_env_is_preserved"])
+                .env(CHILD, "1")
+                .env_remove("ALL_PROXY")
+                .env_remove("all_proxy")
+                .env("HTTPS_PROXY", PROXY)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed;"),
+                "proxy test subprocess did not pass: {stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        run_query(
+            Endpoint::Credits,
+            true,
+            false,
+            false,
+            stub_key,
+            |agent, request| {
+                let proxy = agent
+                    .config()
+                    .proxy()
+                    .expect("HTTPS_PROXY must be preserved");
+                assert_eq!(proxy.uri(), PROXY);
+                assert_eq!(request.uri(), "https://openrouter.ai/api/v1/credits");
+                Ok(Response::new(ureq::Body::builder().data(MOCK_CREDITS)))
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn credits_query_pins_endpoint_and_preserves_human_and_json_output() {
+        let url = "https://openrouter.ai/api/v1/credits";
+        let query = |json| {
+            run_query(
+                Endpoint::Credits,
+                json,
+                false,
+                false,
+                stub_key,
+                mock_response(url, MOCK_CREDITS),
+            )
+            .unwrap()
+        };
         assert_eq!(
-            credits_endpoint("https://openrouter.ai"),
-            "https://openrouter.ai/api/v1/credits"
+            query(false),
+            (
+                "$2.00 remaining  ($8.00 used of $10.00)".to_owned(),
+                Some("Low - top up at https://openrouter.ai/credits".to_owned())
+            )
         );
         assert_eq!(
-            usage_endpoint("https://openrouter.ai"),
-            "https://openrouter.ai/api/v1/auth/key"
+            query(true),
+            (
+                "{\n  \"remaining\": 2.0,\n  \"used\": 8.0,\n  \"total\": 10.0\n}".to_owned(),
+                None
+            )
         );
     }
 
     #[test]
-    fn endpoints_double_slash_when_base_has_trailing_slash() {
+    fn usage_query_pins_endpoint_and_preserves_human_and_json_output() {
+        let url = "https://openrouter.ai/api/v1/auth/key";
+        let body = r#"{"data":{"usage_daily":0.25,"usage_weekly":1.5,"usage_monthly":8,"byok_usage_daily":0.5,"byok_usage_weekly":1,"byok_usage_monthly":2}}"#;
+        let query = |json| {
+            run_query(
+                Endpoint::Usage,
+                json,
+                false,
+                false,
+                stub_key,
+                mock_response(url, body),
+            )
+            .unwrap()
+        };
         assert_eq!(
-            credits_endpoint("https://openrouter.ai/"),
-            "https://openrouter.ai//api/v1/credits"
+            query(false),
+            (
+                "Daily:   $0.75\nWeekly:  $2.50\nMonthly: $10.00".to_owned(),
+                None
+            )
         );
         assert_eq!(
-            usage_endpoint("https://openrouter.ai/"),
-            "https://openrouter.ai//api/v1/auth/key"
+            query(true),
+            (
+                "{\n  \"daily\": 0.75,\n  \"weekly\": 2.5,\n  \"monthly\": 10.0\n}".to_owned(),
+                None
+            )
         );
     }
 
     #[test]
-    fn empty_base_url_produces_root_relative_paths() {
-        assert_eq!(credits_endpoint(""), "/api/v1/credits");
-        assert_eq!(usage_endpoint(""), "/api/v1/auth/key");
+    fn override_is_rejected_before_credentials_or_transport() {
+        for endpoint in [Endpoint::Credits, Endpoint::Usage] {
+            let error = run_query(
+                endpoint,
+                false,
+                false,
+                true,
+                || panic!("looked up credentials with an endpoint override"),
+                |_, _| panic!("called transport with an endpoint override"),
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "Error: OPENROUTER_BASE_URL is no longer supported. Unset it to use OpenRouter."
+            );
+        }
+    }
+
+    #[test]
+    fn redirects_are_disabled_and_3xx_responses_are_rejected() {
+        for (status, target) in [
+            (302, "https://example.invalid/"),
+            (307, "https://openrouter.ai/"),
+        ] {
+            let error = run_query(
+                Endpoint::Credits,
+                true,
+                false,
+                false,
+                stub_key,
+                |agent, _| {
+                    assert_eq!(agent.config().max_redirects(), 0);
+                    Ok(Response::builder()
+                        .status(status)
+                        .header(header::LOCATION, format!("{target}{SYNTHETIC_KEY}"))
+                        .body(ureq::Body::builder().data(MOCK_CREDITS))
+                        .unwrap())
+                },
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "Error: OpenRouter HTTP redirect refused."
+            );
+        }
+    }
+
+    #[test]
+    fn requests_have_a_global_timeout_and_redact_timeout_errors() {
+        let error = run_query(Endpoint::Usage, true, false, false, stub_key, |agent, _| {
+            assert_eq!(
+                agent.config().timeouts().global,
+                Some(Duration::from_secs(10))
+            );
+            Err(ureq::Error::Timeout(ureq::Timeout::Global))
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "Error: OpenRouter request timed out.");
+
+        struct TimedOutBody;
+        impl io::Read for TimedOutBody {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::TimedOut, SYNTHETIC_KEY))
+            }
+        }
+        let error = run_query(Endpoint::Credits, true, false, false, stub_key, |_, _| {
+            Ok(Response::new(ureq::Body::builder().reader(TimedOutBody)))
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "Error: OpenRouter request timed out.");
+    }
+
+    #[test]
+    fn transport_status_and_json_errors_do_not_echo_credentials() {
+        let error = run_query(Endpoint::Credits, false, false, false, stub_key, |_, _| {
+            Err(ureq::Error::Io(io::Error::other(SYNTHETIC_KEY)))
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "Error: OpenRouter request failed.");
+
+        for (status, diagnostic) in [
+            (200, "Error: Invalid OpenRouter response."),
+            (401, "Error: OpenRouter returned HTTP 401."),
+        ] {
+            let error = run_query(Endpoint::Credits, false, false, false, stub_key, |_, _| {
+                Ok(Response::builder()
+                    .status(status)
+                    .body(ureq::Body::builder().data(format!(r#"{{"data":"{SYNTHETIC_KEY}"}}"#)))
+                    .unwrap())
+            })
+            .unwrap_err();
+            assert_eq!(error.to_string(), diagnostic);
+        }
+    }
+
+    #[test]
+    fn invalid_bearer_header_is_rejected_without_echo_or_transport() {
+        let error = run_query(
+            Endpoint::Usage,
+            true,
+            false,
+            false,
+            || Ok(format!("{SYNTHETIC_KEY}\n")),
+            |_, _| panic!("sent an invalid authorization header"),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "Error: Invalid API key format.");
     }
 
     #[test]
@@ -735,14 +972,20 @@ mod tests {
     }
 
     #[test]
-    fn api_key_missing_display_mentions_save_command() {
+    fn query_with_missing_key_gives_manual_setup_guidance_without_transport() {
+        let error = run_query(
+            Endpoint::Credits,
+            false,
+            false,
+            false,
+            || Err(AppError::ApiKeyMissing),
+            |_, _| panic!("called transport without a key"),
+        )
+        .unwrap_err();
         assert_eq!(
-            AppError::ApiKeyMissing.to_string(),
-            "Error: API key not found. Run: stips key save <your-key>"
-        );
-        assert_eq!(
-            AppError::Message(String::from("Error: failed to open URL")).to_string(),
-            "Error: failed to open URL"
+            error.to_string(),
+            "Error: API key not found. Set OPENROUTER_API_KEY or use macOS Keychain Access \
+             (service: openrouter-api-key, account: openrouter)."
         );
     }
 }
