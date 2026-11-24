@@ -1,21 +1,28 @@
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Read};
 #[cfg(target_os = "macos")]
 use std::process::Command;
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use serde::Deserialize;
+use std::sync::mpsc;
 use ureq::http::{Request, Response, header};
+use ureq::unversioned::resolver::{DefaultResolver, Resolver};
+use ureq::unversioned::transport::{
+    Buffers, ConnectionDetails, Connector, DefaultConnector, NextTimeout, Transport,
+};
 
 const OPENROUTER_KEYS_PAGE: &str = "https://openrouter.ai/keys";
 const OPENROUTER_TOPUP_PAGE: &str = "https://openrouter.ai/credits";
 const KEYCHAIN_SERVICE: &str = "openrouter-api-key";
 const KEYCHAIN_ACCOUNT: &str = "openrouter";
 const LOW_BALANCE_THRESHOLD: f64 = 5.0;
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
+const RESPONSE_CAP: usize = 256 * 1024;
 
 #[derive(Parser, Debug)]
 #[command(name = "stips", about = "OpenRouter credits and usage CLI", version)]
@@ -45,7 +52,7 @@ enum KeyCommands {
     Open,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum Endpoint {
     Credits,
     Usage,
@@ -186,7 +193,7 @@ fn run_query(
     is_tty: bool,
     has_endpoint_override: bool,
     read_key: impl FnOnce() -> Result<String, AppError>,
-    send: impl FnOnce(&ureq::Agent, Request<()>) -> HttpResult,
+    send: impl FnOnce(&ureq::Agent, Request<()>) -> HttpResult + Send + 'static,
 ) -> Result<(String, Option<String>), AppError> {
     if has_endpoint_override {
         return Err(AppError::Message(
@@ -194,39 +201,72 @@ fn run_query(
         ));
     }
     let key = read_key()?;
-    let json_error = |_| AppError::Message("Could not format JSON output.");
+    let bytes = request_body(endpoint, &key, send)?;
     match endpoint {
-        Endpoint::Credits => {
-            let response: CreditsEnvelope = request_json(endpoint, &key, send)?;
-            let used = response.data.total_usage;
-            let total = response.data.total_credits;
-            let remaining = remaining_credits(total, used);
-            if json {
-                Ok((
-                    format_credits_json(remaining, used, total).map_err(json_error)?,
-                    None,
-                ))
-            } else {
-                Ok((
-                    format_credits_text(remaining, used, total),
-                    low_balance_message(remaining, is_tty),
-                ))
-            }
-        }
-        Endpoint::Usage => {
-            let response: UsageEnvelope = request_json(endpoint, &key, send)?;
-            let data = response.data;
-            let daily = combined_usage(data.usage_daily, data.byok_usage_daily);
-            let weekly = combined_usage(data.usage_weekly, data.byok_usage_weekly);
-            let monthly = combined_usage(data.usage_monthly, data.byok_usage_monthly);
-            let output = if json {
-                format_usage_json(daily, weekly, monthly).map_err(json_error)?
-            } else {
-                format_usage_text(daily, weekly, monthly)
-            };
-            Ok((output, None))
-        }
+        Endpoint::Credits => credits_report(decode::<CreditsEnvelope>(&bytes)?.data, json, is_tty),
+        Endpoint::Usage => usage_report(decode::<UsageEnvelope>(&bytes)?.data, json),
     }
+}
+
+fn finite(value: f64) -> Result<f64, AppError> {
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(AppError::Message("Unrepresentable OpenRouter report."))
+    }
+}
+
+impl TryFrom<CreditsData> for CreditsOutput {
+    type Error = AppError;
+
+    fn try_from(data: CreditsData) -> Result<Self, Self::Error> {
+        let used = finite(data.total_usage)?;
+        let total = finite(data.total_credits)?;
+        Ok(Self {
+            remaining: finite(remaining_credits(total, used))?,
+            used,
+            total,
+        })
+    }
+}
+
+impl TryFrom<UsageData> for UsageOutput {
+    type Error = AppError;
+
+    fn try_from(data: UsageData) -> Result<Self, Self::Error> {
+        let period = |usage, byok| finite(combined_usage(finite(usage)?, finite(byok)?));
+        Ok(Self {
+            daily: period(data.usage_daily, data.byok_usage_daily)?,
+            weekly: period(data.usage_weekly, data.byok_usage_weekly)?,
+            monthly: period(data.usage_monthly, data.byok_usage_monthly)?,
+        })
+    }
+}
+
+fn credits_report(
+    data: CreditsData,
+    json: bool,
+    is_tty: bool,
+) -> Result<(String, Option<String>), AppError> {
+    let report = CreditsOutput::try_from(data)?;
+    if json {
+        Ok((format_json(&report)?, None))
+    } else {
+        Ok((
+            format_credits_text(report.remaining, report.used, report.total),
+            low_balance_message(report.remaining, is_tty),
+        ))
+    }
+}
+
+fn usage_report(data: UsageData, json: bool) -> Result<(String, Option<String>), AppError> {
+    let report = UsageOutput::try_from(data)?;
+    let output = if json {
+        format_json(&report)?
+    } else {
+        format_usage_text(report.daily, report.weekly, report.monthly)
+    };
+    Ok((output, None))
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -275,11 +315,108 @@ fn read_api_key() -> Result<String, AppError> {
     }
 }
 
-fn request_json<T: serde::de::DeserializeOwned>(
+// ureq 3.2 strips Content-Length before exposing a gzip response. Check it
+// on the plaintext side of the normal TLS/proxy chain without changing any
+// bytes. ureq still owns HTTP framing, header parsing and decompression.
+#[derive(Debug)]
+struct WireLengthGuard(Endpoint);
+
+impl<T: Transport> Connector<T> for WireLengthGuard {
+    type Out = CheckedTransport<T>;
+
+    fn connect(
+        &self,
+        details: &ConnectionDetails,
+        chained: Option<T>,
+    ) -> Result<Option<Self::Out>, ureq::Error> {
+        let Some(mut inner) = chained else {
+            return Ok(None);
+        };
+        // The default CONNECT connector can recurse for the proxy itself.
+        // Inspect only the pinned origin response, never the proxy tunnel.
+        let checking = details.uri == self.0.url() && !checked_head(inner.buffers().input())?;
+        Ok(Some(CheckedTransport { inner, checking }))
+    }
+}
+
+#[derive(Debug)]
+struct CheckedTransport<T> {
+    inner: T,
+    checking: bool,
+}
+
+impl<T: Transport> Transport for CheckedTransport<T> {
+    fn buffers(&mut self) -> &mut dyn Buffers {
+        self.inner.buffers()
+    }
+    fn transmit_output(&mut self, n: usize, timeout: NextTimeout) -> Result<(), ureq::Error> {
+        self.inner.transmit_output(n, timeout)
+    }
+    fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, ureq::Error> {
+        let progress = self.inner.await_input(timeout)?;
+        if self.checking {
+            self.checking = !checked_head(self.inner.buffers().input())?;
+        }
+        Ok(progress)
+    }
+    fn is_open(&mut self) -> bool {
+        self.inner.is_open()
+    }
+    fn is_tls(&self) -> bool {
+        self.inner.is_tls()
+    }
+}
+
+// Incomplete heads stay in ureq's input buffer. Inspect complete lines only,
+// including a final response coalesced with a 100 Continue. Stop at the blank
+// line: neither header values nor any following body need to be copied.
+fn checked_head(input: &[u8]) -> Result<bool, ureq::Error> {
+    let mut lines = input
+        .split_inclusive(|&b| b == b'\n')
+        .map_while(|line| line.strip_suffix(b"\n"))
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line));
+    while let Some(status) = lines.find(|line| !line.is_empty()) {
+        let code = status
+            .split(|b| b.is_ascii_whitespace())
+            .filter(|s| !s.is_empty())
+            .nth(1)
+            .unwrap_or_default();
+        let interim = code == b"100";
+        let success = code.starts_with(b"2");
+        for line in lines.by_ref() {
+            if line.is_empty() {
+                if interim {
+                    break;
+                }
+                return Ok(true);
+            }
+            if success
+                && let Some(i) = line.iter().position(|&b| b == b':')
+                && line[..i].eq_ignore_ascii_case(b"content-length")
+            {
+                check_length(&line[i + 1..])?;
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn check_length(value: &[u8]) -> Result<(), ureq::Error> {
+    let n = std::str::from_utf8(value.trim_ascii())
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
+    if n > RESPONSE_CAP as u64 {
+        return Err(ureq::Error::BodyExceedsLimit(RESPONSE_CAP as u64));
+    }
+    Ok(())
+}
+
+fn request_body(
     endpoint: Endpoint,
     api_key: &str,
-    send: impl FnOnce(&ureq::Agent, Request<()>) -> HttpResult,
-) -> Result<T, AppError> {
+    send: impl FnOnce(&ureq::Agent, Request<()>) -> HttpResult + Send + 'static,
+) -> Result<Vec<u8>, AppError> {
     let mut bearer = header::HeaderValue::from_str(&format!("Bearer {api_key}"))
         .map_err(|_| AppError::Message("Invalid API key format."))?;
     bearer.set_sensitive(true);
@@ -287,16 +424,65 @@ fn request_json<T: serde::de::DeserializeOwned>(
         .header(header::AUTHORIZATION, bearer)
         .body(())
         .map_err(|_| AppError::Message("Could not build OpenRouter request."))?;
-    let agent = ureq::Agent::config_builder()
+    let agent = billing_agent(
+        endpoint,
+        DefaultConnector::default(),
+        DefaultResolver::default(),
+    );
+    fetch_before(Instant::now() + REQUEST_TIMEOUT, move || {
+        send(&agent, request)
+    })
+}
+
+fn billing_agent(
+    endpoint: Endpoint,
+    connector: impl Connector,
+    resolver: impl Resolver,
+) -> ureq::Agent {
+    let config = ureq::Agent::config_builder()
         .https_only(true)
         .max_redirects(0)
         .http_status_as_error(false)
+        .timeout_connect(Some(CONNECT_TIMEOUT))
         .timeout_global(Some(REQUEST_TIMEOUT))
-        .build()
-        .new_agent();
-    let mut response = send(&agent, request)
-        .map_err(|err| sanitized_http_error(err, "OpenRouter request failed."))?;
+        .build();
+    ureq::Agent::with_parts(config, connector.chain(WireLengthGuard(endpoint)), resolver)
+}
 
+// ureq can remain inside a blocking send/read after its global timeout. The
+// one-shot CLI owns only the receiver; on expiry it returns to main without
+// joining the I/O worker. Process exit releases the socket and the worker.
+fn fetch_before(
+    deadline: Instant,
+    send: impl FnOnce() -> HttpResult + Send + 'static,
+) -> Result<Vec<u8>, AppError> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::Builder::new()
+        .spawn(move || {
+            let result = send()
+                .map_err(|err| sanitized_http_error(err, "OpenRouter request failed."))
+                .and_then(|response| read_success(response, deadline));
+            let _ = tx.send(result);
+        })
+        .map_err(|_| AppError::Message("OpenRouter request failed."))?;
+    match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            Err(AppError::Message("OpenRouter request timed out."))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err(AppError::Message("OpenRouter request failed."))
+        }
+        Ok(_) if Instant::now() >= deadline => {
+            Err(AppError::Message("OpenRouter request timed out."))
+        }
+        Ok(result) => result,
+    }
+}
+
+fn read_success(
+    mut response: Response<ureq::Body>,
+    deadline: Instant,
+) -> Result<Vec<u8>, AppError> {
     // With redirects disabled, ureq returns the 3xx response to us. Do not
     // inspect its Location or try to parse its body as a successful response.
     let status = response.status();
@@ -306,15 +492,49 @@ fn request_json<T: serde::de::DeserializeOwned>(
     if !status.is_success() {
         return Err(AppError::HttpStatus(status.as_u16()));
     }
-    let bytes = response
-        .body_mut()
-        .read_to_vec()
-        .map_err(|err| sanitized_http_error(err, "Could not read OpenRouter response."))?;
-    serde_json::from_slice(&bytes).map_err(|_| AppError::Message("Invalid OpenRouter response."))
+    for length in response.headers().get_all(header::CONTENT_LENGTH) {
+        check_length(length.as_bytes())
+            .map_err(|e| sanitized_http_error(e, "Invalid OpenRouter response length."))?;
+    }
+    read_bounded(response.body_mut().as_reader(), deadline, Instant::now)
+}
+
+fn read_bounded(
+    reader: impl Read,
+    deadline: Instant,
+    now: impl Fn() -> Instant,
+) -> Result<Vec<u8>, AppError> {
+    let mut reader = reader.take(RESPONSE_CAP as u64 + 1);
+    let mut bytes = Vec::new();
+    let mut chunk = [0; 8192];
+    loop {
+        if now() >= deadline {
+            return Err(AppError::Message("OpenRouter request timed out."));
+        }
+        let n = reader.read(&mut chunk).map_err(|err| {
+            sanitized_http_error(err.into(), "Could not read OpenRouter response.")
+        })?;
+        if bytes.len() + n > RESPONSE_CAP {
+            return Err(AppError::Message("OpenRouter response too large."));
+        }
+        if n == 0 {
+            // EOF itself may have blocked. Never accept a late final read.
+            if now() >= deadline {
+                return Err(AppError::Message("OpenRouter request timed out."));
+            }
+            return Ok(bytes);
+        }
+        bytes.extend_from_slice(&chunk[..n]);
+    }
+}
+
+fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, AppError> {
+    serde_json::from_slice(bytes).map_err(|_| AppError::Message("Invalid OpenRouter response."))
 }
 
 fn sanitized_http_error(error: ureq::Error, fallback: &'static str) -> AppError {
     match error {
+        ureq::Error::BodyExceedsLimit(_) => AppError::Message("OpenRouter response too large."),
         ureq::Error::Timeout(_) => AppError::Message("OpenRouter request timed out."),
         ureq::Error::Io(err) if err.kind() == io::ErrorKind::TimedOut => {
             AppError::Message("OpenRouter request timed out.")
@@ -353,24 +573,13 @@ fn format_credits_text(remaining: f64, used: f64, total: f64) -> String {
     )
 }
 
-fn format_credits_json(remaining: f64, used: f64, total: f64) -> Result<String, serde_json::Error> {
-    serde_json::to_string_pretty(&CreditsOutput {
-        remaining,
-        used,
-        total,
-    })
+fn format_json(report: &impl serde::Serialize) -> Result<String, AppError> {
+    serde_json::to_string_pretty(report)
+        .map_err(|_| AppError::Message("Could not format JSON output."))
 }
 
 fn format_usage_text(daily: f64, weekly: f64, monthly: f64) -> String {
     format!("Daily:   ${daily:.2}\nWeekly:  ${weekly:.2}\nMonthly: ${monthly:.2}")
-}
-
-fn format_usage_json(daily: f64, weekly: f64, monthly: f64) -> Result<String, serde_json::Error> {
-    serde_json::to_string_pretty(&UsageOutput {
-        daily,
-        weekly,
-        monthly,
-    })
 }
 
 fn low_balance_message(remaining: f64, is_tty: bool) -> Option<String> {
@@ -500,7 +709,12 @@ mod tests {
 
     #[test]
     fn format_credits_json_pretty_prints_fields() {
-        let json = format_credits_json(13.74, 636.26, 650.0).unwrap();
+        let json = format_json(&CreditsOutput {
+            remaining: 13.74,
+            used: 636.26,
+            total: 650.0,
+        })
+        .unwrap();
         assert_eq!(
             json,
             "{\n  \"remaining\": 13.74,\n  \"used\": 636.26,\n  \"total\": 650.0\n}"
@@ -515,7 +729,12 @@ mod tests {
         let total = 650.0;
         let remaining = remaining_credits(total, used);
         let text = format_credits_text(remaining, used, total);
-        let json = format_credits_json(remaining, used, total).unwrap();
+        let json = format_json(&CreditsOutput {
+            remaining,
+            used,
+            total,
+        })
+        .unwrap();
         assert_ne!(remaining, 13.74);
         assert!(text.starts_with("$13.74 remaining"), "text was {text:?}");
         assert!(
@@ -667,7 +886,12 @@ mod tests {
 
     #[test]
     fn format_usage_json_pretty_prints_fields() {
-        let json = format_usage_json(0.11, 1.45, 10.75).unwrap();
+        let json = format_json(&UsageOutput {
+            daily: 0.11,
+            weekly: 1.45,
+            monthly: 10.75,
+        })
+        .unwrap();
         assert_eq!(
             json,
             "{\n  \"daily\": 0.11,\n  \"weekly\": 1.45,\n  \"monthly\": 10.75\n}"
@@ -703,13 +927,404 @@ mod tests {
     const SYNTHETIC_KEY: &str = "offline-test-credential-sentinel";
     const MOCK_CREDITS: &str = r#"{"data":{"total_credits":10,"total_usage":8}}"#;
 
+    // The command only prints a successful (output, warning) pair. Exercise
+    // that same boundary with an in-memory transport and a recording reader.
+    #[derive(Default, Clone)]
+    struct ReadCounts {
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    struct Probe {
+        data: io::Cursor<Vec<u8>>,
+        counts: ReadCounts,
+        chunk: usize,
+        fail_at_eof: bool,
+    }
+
+    impl Probe {
+        fn new(data: Vec<u8>) -> (Self, ReadCounts) {
+            let counts = ReadCounts::default();
+            (
+                Self {
+                    data: io::Cursor::new(data),
+                    counts: counts.clone(),
+                    chunk: usize::MAX,
+                    fail_at_eof: false,
+                },
+                counts,
+            )
+        }
+    }
+
+    use std::sync::atomic::Ordering::Relaxed;
+
+    impl Read for Probe {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.counts.calls.fetch_add(1, Relaxed);
+            let limit = buf.len().min(self.chunk);
+            let n = self.data.read(&mut buf[..limit])?;
+            self.counts.bytes.fetch_add(n, Relaxed);
+            if n == 0 && self.fail_at_eof {
+                Err(io::Error::other(SYNTHETIC_KEY))
+            } else {
+                Ok(n)
+            }
+        }
+    }
+
+    fn probe_query(
+        probe: Probe,
+        length: Option<usize>,
+        status: u16,
+        json: bool,
+    ) -> Result<(String, Option<String>), AppError> {
+        run_query(
+            Endpoint::Credits,
+            json,
+            false,
+            false,
+            stub_key,
+            move |_, _| {
+                let mut response = Response::builder().status(status);
+                if let Some(n) = length {
+                    response = response.header(header::CONTENT_LENGTH, n);
+                }
+                Ok(response.body(ureq::Body::builder().reader(probe)).unwrap())
+            },
+        )
+    }
+
+    #[test]
+    fn zg_report_exact_cap_valid_response() {
+        let mut data = MOCK_CREDITS.as_bytes().to_vec();
+        data.resize(RESPONSE_CAP, b' ');
+        let (probe, counts) = Probe::new(data);
+        let (output, warning) = probe_query(probe, Some(RESPONSE_CAP), 200, true).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&output).unwrap()["remaining"],
+            2.0
+        );
+        assert_eq!(warning, None);
+        assert_eq!(counts.bytes.load(Relaxed), RESPONSE_CAP);
+    }
+
+    #[test]
+    fn zg_report_declared_oversize_and_error_status_skip_body() {
+        for (status, diagnostic) in [
+            (200, "Error: OpenRouter response too large."),
+            (403, "Error: OpenRouter returned HTTP 403."),
+        ] {
+            let (probe, counts) = Probe::new(MOCK_CREDITS.as_bytes().to_vec());
+            let err = probe_query(probe, Some(RESPONSE_CAP + 1), status, false).unwrap_err();
+            assert_eq!(err.to_string(), diagnostic);
+            assert_eq!(counts.calls.load(Relaxed), 0);
+        }
+    }
+
+    #[test]
+    fn zg_report_actual_cap_independent_of_header() {
+        for (length, size) in [(None, RESPONSE_CAP + 1), (Some(1), RESPONSE_CAP * 2)] {
+            let (probe, counts) = Probe::new(vec![b' '; size]);
+            let err = probe_query(probe, length, 200, true).unwrap_err();
+            assert_eq!(err.to_string(), "Error: OpenRouter response too large.");
+            assert_eq!(counts.bytes.load(Relaxed), RESPONSE_CAP + 1);
+        }
+    }
+
+    #[test]
+    fn zg_report_absolute_deadline_does_not_join_blocked_io() {
+        struct BlockedRead {
+            entered: mpsc::Sender<Instant>,
+            release: std::sync::Mutex<mpsc::Receiver<()>>,
+        }
+        impl Read for BlockedRead {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                self.entered.send(Instant::now()).unwrap();
+                // Bound the fixture itself so a regression cannot hang the suite.
+                self.release
+                    .get_mut()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(3))
+                    .unwrap();
+                Ok(0)
+            }
+        }
+        for block_in_send in [true, false] {
+            let (release, gate) = mpsc::channel();
+            let (entered, started) = mpsc::channel();
+            let deadline = Instant::now() + Duration::from_millis(250);
+            let err = fetch_before(deadline, move || {
+                let mut block = BlockedRead {
+                    entered,
+                    release: std::sync::Mutex::new(gate),
+                };
+                if block_in_send {
+                    block.read(&mut [0])?;
+                }
+                Ok(Response::new(ureq::Body::builder().reader(block)))
+            })
+            .unwrap_err();
+            assert_eq!(err.to_string(), "Error: OpenRouter request timed out.");
+            assert!(started.try_recv().unwrap() < deadline);
+            assert!(Instant::now() >= deadline);
+            // Only now can the blocked send or read return.
+            release.send(()).unwrap();
+        }
+    }
+
+    // Supply only DNS and the byte stream. Agent::run still executes ureq's
+    // actual HTTP framing, header removal and gzip decoder, without a socket.
+    #[derive(Debug)]
+    struct FixtureResolver;
+    impl Resolver for FixtureResolver {
+        fn resolve(
+            &self,
+            _: &ureq::http::Uri,
+            _: &ureq::config::Config,
+            _: NextTimeout,
+        ) -> Result<ureq::unversioned::resolver::ResolvedSocketAddrs, ureq::Error> {
+            let mut addrs = self.empty();
+            addrs.push(([127, 0, 0, 1], 443).into());
+            Ok(addrs)
+        }
+    }
+
+    #[derive(Debug)]
+    struct WireFixture {
+        declared: usize,
+        gzip: Vec<u8>,
+        body_reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[derive(Debug)]
+    struct FixtureStream {
+        chunks: std::vec::IntoIter<Vec<u8>>,
+        buffers: ureq::unversioned::transport::LazyBuffers,
+        body_reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl Connector for WireFixture {
+        type Out = FixtureStream;
+        fn connect(
+            &self,
+            _: &ConnectionDetails,
+            _: Option<()>,
+        ) -> Result<Option<FixtureStream>, ureq::Error> {
+            let head = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\ncOnTeNt-Le";
+            let tail = format!("NgTh: {}\r\n\r\n", self.declared);
+            Ok(Some(FixtureStream {
+                chunks: vec![head.to_vec(), tail.into_bytes(), self.gzip.clone()].into_iter(),
+                buffers: ureq::unversioned::transport::LazyBuffers::new(1024, 1024),
+                body_reads: self.body_reads.clone(),
+            }))
+        }
+    }
+    impl Transport for FixtureStream {
+        fn buffers(&mut self) -> &mut dyn Buffers {
+            &mut self.buffers
+        }
+        fn transmit_output(&mut self, _: usize, _: NextTimeout) -> Result<(), ureq::Error> {
+            Ok(())
+        }
+        fn await_input(&mut self, _: NextTimeout) -> Result<bool, ureq::Error> {
+            if self.chunks.len() == 1 {
+                self.body_reads.fetch_add(1, Relaxed);
+            }
+            let Some(chunk) = self.chunks.next() else {
+                return Ok(false);
+            };
+            self.buffers.input_append_buf()[..chunk.len()].copy_from_slice(&chunk);
+            self.buffers.input_appended(chunk.len());
+            Ok(true)
+        }
+        fn is_tls(&self) -> bool {
+            true
+        }
+        fn is_open(&mut self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn zg_report_gzip_wire_and_decoded_limits_are_independent() {
+        // gzip(MOCK_CREDITS), and a 290-byte gzip member containing 262,145 spaces.
+        let small = vec![
+            31, 139, 8, 0, 0, 0, 0, 0, 2, 3, 171, 86, 74, 73, 44, 73, 84, 178, 170, 86, 42, 201,
+            47, 73, 204, 137, 79, 46, 74, 77, 201, 44, 41, 86, 178, 50, 52, 208, 129, 10, 149, 22,
+            39, 166, 167, 42, 89, 89, 212, 214, 2, 0, 129, 139, 225, 74, 45, 0, 0, 0,
+        ];
+        let mut expands = vec![
+            31, 139, 8, 0, 0, 0, 0, 0, 2, 3, 237, 193, 49, 1, 0, 0, 0, 194, 160, 42, 235, 159, 210,
+            223, 12, 64, 1,
+        ];
+        expands.resize(280, 0);
+        expands.extend([156, 1, 80, 20, 74, 200, 1, 0, 4, 0]);
+        for (declared, gzip, decoded_oversize) in [
+            (RESPONSE_CAP + 1, small.clone(), false),
+            (small.len(), small, false),
+            (expands.len(), expands, true),
+        ] {
+            let body_reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let fixture = WireFixture {
+                declared,
+                gzip,
+                body_reads: body_reads.clone(),
+            };
+            let agent = billing_agent(Endpoint::Credits, fixture, FixtureResolver);
+            let received = agent.get(Endpoint::Credits.url()).call();
+            if declared > RESPONSE_CAP {
+                assert!(matches!(received, Err(ureq::Error::BodyExceedsLimit(_))));
+                assert_eq!(body_reads.load(Relaxed), 0);
+                continue;
+            }
+            let response = received.unwrap();
+            assert!(!response.headers().contains_key(header::CONTENT_LENGTH));
+            assert!(!response.headers().contains_key(header::CONTENT_ENCODING));
+            let bytes = read_success(response, Instant::now() + REQUEST_TIMEOUT);
+            if decoded_oversize {
+                assert_eq!(
+                    bytes.unwrap_err().to_string(),
+                    "Error: OpenRouter response too large."
+                );
+            } else {
+                assert_eq!(bytes.unwrap(), MOCK_CREDITS.as_bytes());
+            }
+            assert_eq!(body_reads.load(Relaxed), 1);
+        }
+    }
+
+    #[test]
+    fn zg_report_trickle_deadline_includes_final_eof() {
+        let start = Instant::now();
+        // Four seconds for each read: expire on the third byte, or on EOF
+        // following two prompt bytes. No chunk gets a fresh 12-second budget.
+        for size in [100, 2] {
+            let (mut probe, counts) = Probe::new(vec![b' '; size]);
+            probe.chunk = 1;
+            let err = read_bounded(probe, start + REQUEST_TIMEOUT, || {
+                start + Duration::from_secs(4 * counts.calls.load(Relaxed) as u64)
+            })
+            .unwrap_err();
+            assert_eq!(err.to_string(), "Error: OpenRouter request timed out.");
+            assert_eq!(counts.calls.load(Relaxed), 3);
+        }
+    }
+
+    #[test]
+    fn zg_report_error_after_complete_json_is_not_eof() {
+        for json in [false, true] {
+            let (mut probe, _) = Probe::new(MOCK_CREDITS.as_bytes().to_vec());
+            probe.fail_at_eof = true;
+            let err = probe_query(probe, None, 200, json).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "Error: Could not read OpenRouter response."
+            );
+        }
+    }
+
+    #[test]
+    fn zg_report_invalid_or_overflow_in_either_mode_has_no_output_pair() {
+        for json in [false, true] {
+            for (endpoint, body, diagnostic) in [
+                (
+                    Endpoint::Usage,
+                    r#"{"data":{"usage_daily":0,"usage_weekly":0,"usage_monthly":1e308,"byok_usage_monthly":1e308}}"#,
+                    "Error: Unrepresentable OpenRouter report.",
+                ),
+                (
+                    Endpoint::Credits,
+                    r#"{"data":{"total_credits":-1e308,"total_usage":1e308}}"#,
+                    "Error: Unrepresentable OpenRouter report.",
+                ),
+                (
+                    Endpoint::Credits,
+                    r#"{"data":{"total_credits":0,"total_usage":"https://private.invalid/"}}"#,
+                    "Error: Invalid OpenRouter response.",
+                ),
+            ] {
+                let err = run_query(
+                    endpoint,
+                    json,
+                    false,
+                    false,
+                    stub_key,
+                    mock_response(endpoint.url(), body),
+                )
+                .unwrap_err();
+                assert_eq!(err.to_string(), diagnostic);
+            }
+            for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                let err = credits_report(
+                    CreditsData {
+                        total_usage: value,
+                        total_credits: 0.0,
+                    },
+                    json,
+                    false,
+                )
+                .unwrap_err();
+                assert_eq!(err.to_string(), "Error: Unrepresentable OpenRouter report.");
+                let mut data =
+                    parse_usage(r#"{"data":{"usage_daily":0,"usage_weekly":0,"usage_monthly":0}}"#)
+                        .unwrap()
+                        .data;
+                data.byok_usage_weekly = value;
+                assert_eq!(
+                    usage_report(data, json).unwrap_err().to_string(),
+                    "Error: Unrepresentable OpenRouter report."
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn zg_report_finite_byok_and_overdrawn_outputs() {
+        for (endpoint, body, expected_json, text, warning) in [
+            (
+                Endpoint::Usage,
+                r#"{"data":{"usage_daily":0,"usage_weekly":1,"usage_monthly":2,"byok_usage_daily":0.125}}"#,
+                serde_json::json!({"daily":0.125,"weekly":1.0,"monthly":2.0}),
+                "Daily:   $0.12\nWeekly:  $1.00\nMonthly: $2.00",
+                None,
+            ),
+            (
+                Endpoint::Credits,
+                r#"{"data":{"total_credits":5,"total_usage":6.5}}"#,
+                serde_json::json!({"remaining":-1.5,"used":6.5,"total":5.0}),
+                "-$1.50 remaining  ($6.50 used of $5.00)",
+                Some("Low - top up at https://openrouter.ai/credits"),
+            ),
+        ] {
+            let query = |json| {
+                run_query(
+                    endpoint,
+                    json,
+                    false,
+                    false,
+                    stub_key,
+                    mock_response(endpoint.url(), body),
+                )
+                .unwrap()
+            };
+            let (output, actual_warning) = query(false);
+            assert_eq!(output, text);
+            assert_eq!(actual_warning.as_deref(), warning);
+            let (output, actual_warning) = query(true);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&output).unwrap(),
+                expected_json
+            );
+            assert_eq!(actual_warning, None);
+        }
+    }
+
     fn stub_key() -> Result<String, AppError> {
         Ok(SYNTHETIC_KEY.to_owned())
     }
 
     fn mock_response(
-        url: &str,
-        body: &str,
+        url: &'static str,
+        body: &'static str,
     ) -> impl FnOnce(&ureq::Agent, Request<()>) -> HttpResult {
         move |agent, request| {
             assert_eq!(request.method(), "GET");
@@ -857,7 +1472,7 @@ mod tests {
                 false,
                 false,
                 stub_key,
-                |agent, _| {
+                move |agent, _| {
                     assert_eq!(agent.config().max_redirects(), 0);
                     Ok(Response::builder()
                         .status(status)
@@ -879,7 +1494,11 @@ mod tests {
         let error = run_query(Endpoint::Usage, true, false, false, stub_key, |agent, _| {
             assert_eq!(
                 agent.config().timeouts().global,
-                Some(Duration::from_secs(10))
+                Some(Duration::from_secs(12))
+            );
+            assert_eq!(
+                agent.config().timeouts().connect,
+                Some(Duration::from_secs(5))
             );
             Err(ureq::Error::Timeout(ureq::Timeout::Global))
         })
@@ -911,12 +1530,21 @@ mod tests {
             (200, "Error: Invalid OpenRouter response."),
             (401, "Error: OpenRouter returned HTTP 401."),
         ] {
-            let error = run_query(Endpoint::Credits, false, false, false, stub_key, |_, _| {
-                Ok(Response::builder()
-                    .status(status)
-                    .body(ureq::Body::builder().data(format!(r#"{{"data":"{SYNTHETIC_KEY}"}}"#)))
-                    .unwrap())
-            })
+            let error = run_query(
+                Endpoint::Credits,
+                false,
+                false,
+                false,
+                stub_key,
+                move |_, _| {
+                    Ok(Response::builder()
+                        .status(status)
+                        .body(
+                            ureq::Body::builder().data(format!(r#"{{"data":"{SYNTHETIC_KEY}"}}"#)),
+                        )
+                        .unwrap())
+                },
+            )
             .unwrap_err();
             assert_eq!(error.to_string(), diagnostic);
         }
